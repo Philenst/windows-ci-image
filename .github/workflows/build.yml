@@ -1,0 +1,59 @@
+name: Build Windows CI image
+
+# Windows Server Core LTSC 2022 + Git (MinGit) + Pester + PSScriptAnalyzer, for Windows
+# PowerShell 5.1 CI jobs. Built on a Linux runner: crane appends a Windows layer to Microsoft's base image, so no
+# Windows machine or Docker is needed. Monthly rebuild picks up the base image's Patch Tuesday update.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 2 * *'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      IMAGE: ghcr.io/philenst/windows-ci-image
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install crane (pinned, SHA-256 checked)
+        run: |
+          set -euo pipefail
+          source versions.env
+          curl -fsSL -o crane.tgz "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${CRANE_SHA256}  crane.tgz" | sha256sum -c -
+          tar -xzf crane.tgz crane && sudo mv crane /usr/local/bin/crane && rm crane.tgz
+          crane version
+
+      - name: Assemble the layer (every download hash-checked)
+        run: bash scripts/assemble-layer.sh "$RUNNER_TEMP/layer.tar"
+
+      - name: Build and push
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          source versions.env
+          echo "$GHCR_TOKEN" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
+          stamp="$(date -u +%Y%m%d)"
+          base_digest="$(crane digest --platform windows/amd64 "$BASE_IMAGE")"
+          crane append --platform windows/amd64 -b "$BASE_IMAGE@$base_digest" -f "$RUNNER_TEMP/layer.tar" -t "$IMAGE:build"
+          # The base image takes PATH from the registry; an image PATH replaces it, so the Windows defaults are listed too.
+          winpath='C:\Windows\system32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0\;C:\Windows\System32\OpenSSH\;C:\Users\ContainerAdministrator\AppData\Local\Microsoft\WindowsApps;C:\MinGit\cmd'
+          crane mutate "$IMAGE:build" \
+            --env "PATH=$winpath" \
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --label "org.opencontainers.image.description=Windows Server Core LTSC 2022 + MinGit $MINGIT_VERSION + Pester $PESTER_VERSION + PSScriptAnalyzer $PSSA_VERSION" \
+            --label "org.opencontainers.image.base.name=$BASE_IMAGE" \
+            --label "org.opencontainers.image.base.digest=$base_digest" \
+            -t "$IMAGE:ltsc2022"
+          crane tag "$IMAGE:ltsc2022" "ltsc2022-$stamp"
+          echo "Pushed $IMAGE:ltsc2022 and $IMAGE:ltsc2022-$stamp (base $BASE_IMAGE@$base_digest)"
+          crane config "$IMAGE:ltsc2022" | python3 -c "import json,sys;c=json.load(sys.stdin);print(c['os'],c.get('os.version'),c['config'].get('Env'))"
